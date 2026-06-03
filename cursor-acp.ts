@@ -2,14 +2,14 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	createAssistantMessageEventStream,
 	type AssistantMessage,
 	type Context,
 	type Model,
 	type SimpleStreamOptions,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
 
 const PROVIDER = "cursor-acp";
 const API = "cursor-acp";
@@ -180,8 +180,13 @@ class AcpProcess {
 			if (!pending) return;
 			this.pending.delete(id);
 			clearTimeout(pending.timer);
-			if (message.error) pending.reject(new Error(message.error.message ?? JSON.stringify(message.error)));
-			else pending.resolve(message.result);
+			if (message.error) {
+				const err = new Error(message.error.message ?? JSON.stringify(message.error)) as Error & {
+					code?: number;
+				};
+				if (typeof message.error.code === "number") err.code = message.error.code;
+				pending.reject(err);
+			} else pending.resolve(message.result);
 			return;
 		}
 
@@ -434,7 +439,23 @@ class CursorAcpBridge {
 	private async applyModel(modelId: string): Promise<void> {
 		if (!this.acp || !this.sessionId) return;
 		if (this.currentModelId === modelId) return;
-		await this.acp.setModel(this.sessionId, modelId);
+		// The synthetic fallback model id means cursor-agent did not advertise any
+		// selectable models; the agent controls the model itself, so don't try to set it.
+		if (isFallbackModelId(modelId)) {
+			this.currentModelId = modelId;
+			return;
+		}
+		try {
+			await this.acp.setModel(this.sessionId, modelId);
+		} catch (error) {
+			// Some cursor-agent builds don't implement session/set_model. Treat an
+			// unsupported method as a no-op rather than failing model selection.
+			if (isMethodNotFound(error)) {
+				this.currentModelId = modelId;
+				return;
+			}
+			throw error;
+		}
 		this.currentModelId = modelId;
 	}
 
@@ -490,6 +511,19 @@ const modelCatalog = new Map<string, CursorModelInfo>();
 let boundPiSessionKey: string | undefined;
 let boundCwd = process.cwd();
 
+const FALLBACK_MODEL_ID = "default[]";
+
+function isFallbackModelId(modelId: string): boolean {
+	return modelId === FALLBACK_MODEL_ID;
+}
+
+function isMethodNotFound(error: unknown): boolean {
+	const code = (error as { code?: number })?.code;
+	if (code === -32601) return true;
+	const message = error instanceof Error ? error.message : String(error);
+	return /method not found|unsupported|not implemented|unknown method/i.test(message);
+}
+
 function contextWindowFor(modelId: string): number {
 	const match = modelId.match(/context=(\d+)k/i);
 	if (match) return Number(match[1]) * 1000;
@@ -507,7 +541,7 @@ async function discoverCursorModels(): Promise<CursorModelInfo[]> {
 		const session = await acp.newSession(process.cwd());
 		const models = session?.models?.availableModels;
 		if (!Array.isArray(models) || models.length === 0) {
-			return [{ modelId: "default[]", name: "Auto" }];
+			return [{ modelId: FALLBACK_MODEL_ID, name: "Auto" }];
 		}
 		return models.map((m: { modelId: string; name: string }) => ({ modelId: m.modelId, name: m.name }));
 	} finally {
@@ -630,7 +664,7 @@ export default async function cursorAcpExtension(pi: ExtensionAPI) {
 	try {
 		models = await discoverCursorModels();
 	} catch (error) {
-		models = [{ modelId: "default[]", name: "Auto" }];
+		models = [{ modelId: FALLBACK_MODEL_ID, name: "Auto" }];
 		console.error(
 			`[cursor-acp] failed to discover Cursor ACP models: ${error instanceof Error ? error.message : String(error)}`,
 		);
