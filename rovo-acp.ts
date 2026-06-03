@@ -69,14 +69,11 @@ class AcpProcess {
 		this.proc.stderr.on("data", (chunk: string) => {
 			if (DEBUG) process.stderr.write(`[rovo-acp stderr] ${chunk}`);
 		});
+		this.proc.on("error", (error) => {
+			this.fail(new Error(`failed to start rovo acp command "${ROVO_COMMAND}": ${error.message}`));
+		});
 		this.proc.on("exit", (code, signal) => {
-			this.closed = true;
-			const error = new Error(`rovo acp exited (${code ?? signal ?? "unknown"})`);
-			for (const pending of this.pending.values()) {
-				clearTimeout(pending.timer);
-				pending.reject(error);
-			}
-			this.pending.clear();
+			this.fail(new Error(`rovo acp exited (${code ?? signal ?? "unknown"})`));
 		});
 	}
 
@@ -149,9 +146,20 @@ class AcpProcess {
 		if (!this.proc.killed) this.proc.kill();
 	}
 
+	private fail(error: Error): void {
+		this.closed = true;
+		for (const pending of this.pending.values()) {
+			clearTimeout(pending.timer);
+			pending.reject(error);
+		}
+		this.pending.clear();
+	}
+
 	private write(message: JsonRpcMessage): void {
 		if (DEBUG) process.stderr.write(`[rovo-acp ->] ${JSON.stringify(message)}\n`);
-		this.proc.stdin.write(`${JSON.stringify(message)}\n`);
+		this.proc.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
+			if (error) this.fail(error);
+		});
 	}
 
 	private onStdout(chunk: string): void {
