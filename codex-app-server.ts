@@ -4,7 +4,7 @@
  * Bridges pi to OpenAI Codex running in app-server mode
  * (`codex app-server`, stdio JSON-RPC transport). Each Codex model is
  * registered as a pi provider model, so they appear in pi's `/model` picker
- * labelled with "(Codex)". Selecting one routes the conversation through
+ * labelled with "[codex-app-server]". Selecting one routes the conversation through
  * Codex, which works directly in your workspace.
  *
  * Modeled on the cursor-acp.ts ACP bridge.
@@ -620,8 +620,8 @@ export default async function codexAppServerExtension(pi: ExtensionAPI) {
 		streamSimple: streamCodexProvider,
 		models: models.map((m) => ({
 			id: m.id,
-			// Surfaced in the /model picker as e.g. "GPT-5.4 (Codex)".
-			name: `${m.displayName} (Codex)`,
+			// Surfaced in the /model picker as e.g. "GPT-5.4 [codex-app-server]".
+			name: `${m.displayName} [codex-app-server]`,
 			reasoning: m.reasoning,
 			input: m.input,
 			contextWindow: m.contextWindow,
