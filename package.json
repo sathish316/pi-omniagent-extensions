@@ -1,0 +1,14 @@
+{
+  "name": "sathish-pi-agent-extensions",
+  "private": true,
+  "type": "module",
+  "description": "Loose Pi agent extensions and their runtime dependencies.",
+  "scripts": {
+    "install:deps": "npm install",
+    "check:claude-code-acp-deps": "node --input-type=module -e \"await import('@agentclientprotocol/sdk'); await import('@agentclientprotocol/claude-agent-acp'); console.log('claude-code-acp dependencies OK')\""
+  },
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "^0.40.0",
+    "@agentclientprotocol/sdk": "^0.24.0"
+  }
+}
