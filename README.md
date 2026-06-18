@@ -4,7 +4,7 @@
 
 ### The common idea (read this first)
 
-All four files do the same job: they let Pi (the host coding agent) drive another coding agent's CLI as if it were just another model in Pi's `/model` picker. You pick "Cursor Sonnet" or "GPT-5 [codex-app-server]" or "Opus [claude-code-acp]" in Pi, and your turn is secretly executed by that external agent running in your workspace.
+All four files do the same job: they let Pi (the host coding agent) drive another coding agent's CLI as if it were just another model in Pi's `/model` picker. It uses ACP (https://agentclientprotocol.com/) to communicate with any coding agent. You pick "Cursor Sonnet" or "GPT-5 [codex-app-server]" or "Opus [claude-code-acp]" in Pi, and your turn is secretly executed by that external agent running in your workspace.
 
 They all follow this shape:
 
