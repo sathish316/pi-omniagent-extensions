@@ -34,7 +34,8 @@ import {
 	type Model,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import { acpProviderGate } from "./acp-lib/config.ts";
+import { acpProviderGate, type AcpRefresher } from "./acp-lib/config.ts";
+import { isModelCacheStale, readModelCache, writeModelCache } from "./acp-lib/model-cache.ts";
 
 const PROVIDER = "codex-app-server";
 const API = "codex-app-server";
@@ -660,30 +661,32 @@ function formatCommand(command: unknown): string {
 	return "command";
 }
 
-export default async function codexAppServerExtension(pi: ExtensionAPI) {
-	const gate = acpProviderGate(pi, "codex");
-	if (!gate.enabled) return;
+const CACHE_KEY = "codex-app-server";
 
-	let models: CodexModelInfo[];
-	try {
-		models = await discoverCodexModels();
-	} catch (error) {
-		models = [];
-		console.error(
-			`[codex-app-server] failed to discover Codex models: ${error instanceof Error ? error.message : String(error)}`,
-		);
-		gate.failed(error);
+/** Revalidate a cached model list; null on any shape drift means "cache miss". */
+function reviveCachedModels(raw: unknown): CodexModelInfo[] | null {
+	if (!Array.isArray(raw) || raw.length === 0) return null;
+	const out: CodexModelInfo[] = [];
+	for (const item of raw) {
+		if (!item || typeof item !== "object") return null;
+		const entry = item as Record<string, unknown>;
+		if (typeof entry.id !== "string" || typeof entry.displayName !== "string") return null;
+		if (!Array.isArray(entry.supportedReasoningEfforts) || !Array.isArray(entry.input)) return null;
+		out.push({
+			id: entry.id,
+			displayName: entry.displayName,
+			supportedReasoningEfforts: entry.supportedReasoningEfforts.filter(
+				(e): e is string => typeof e === "string",
+			),
+			contextWindow: typeof entry.contextWindow === "number" ? entry.contextWindow : 200_000,
+			input: entry.input.filter((i): i is "text" | "image" => i === "text" || i === "image"),
+		});
 	}
-	if (models.length === 0) {
-		console.error("[codex-app-server] no Codex models discovered; provider not registered.");
-		gate.failed(new Error("no Codex models discovered"));
-		return;
-	}
+	return out;
+}
 
-	const variants = createModelVariants(models);
-	for (const variant of variants) modelCatalog.set(variant.id, variant);
-
-	pi.registerProvider(PROVIDER, {
+function providerDefinition(variants: CodexModelVariant[]) {
+	return {
 		name: "Codex (app-server)",
 		baseUrl: "stdio://codex/app-server",
 		apiKey: "codex-app-server",
@@ -700,12 +703,106 @@ export default async function codexAppServerExtension(pi: ExtensionAPI) {
 			maxTokens: 32_768,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		})),
-	});
-	gate.loaded(variants.length);
+	};
+}
+
+function sameVariantIds(a: CodexModelVariant[], b: CodexModelVariant[]): boolean {
+	if (a.length !== b.length) return false;
+	return a.every((variant, index) => variant.id === b[index].id);
+}
+
+export default async function codexAppServerExtension(pi: ExtensionAPI) {
+	const gate = acpProviderGate(pi, "codex");
+	if (!gate.enabled) return;
+
+	const cached = readModelCache<unknown>(CACHE_KEY);
+	const cachedModels = cached ? reviveCachedModels(cached.models) : null;
+	let models: CodexModelInfo[];
+	let source: string;
+	if (cachedModels) {
+		models = cachedModels;
+		source = "cache";
+	} else {
+		// First run (or wiped cache): pay the one-time discovery cost so the model
+		// picker is real from the start; every later start is a cache hit.
+		source = "discovered";
+		try {
+			models = await discoverCodexModels();
+		} catch (error) {
+			models = [];
+			source = "fallback";
+			console.error(
+					`[codex-app-server] failed to discover Codex models: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+			gate.failed(error);
+		}
+		if (models.length > 0) writeModelCache(CACHE_KEY, models);
+	}
+	if (models.length === 0) {
+		console.error("[codex-app-server] no Codex models discovered; provider not registered.");
+		gate.failed(new Error("no Codex models discovered"));
+		return;
+	}
+
+	let variants = createModelVariants(models);
+	for (const variant of variants) modelCatalog.set(variant.id, variant);
+
+	pi.registerProvider(PROVIDER, providerDefinition(variants));
+	gate.loaded(variants.length, source);
+
+	let refreshInFlight: Promise<void> | null = null;
+
+	const refresh: AcpRefresher = async ({ force, notify }) => {
+		const entry = readModelCache<unknown>(CACHE_KEY);
+		if (!force && entry && !isModelCacheStale(entry)) return { changed: false, models: variants.length };
+
+		const discovered = await discoverCodexModels();
+		if (discovered.length === 0) throw new Error("no Codex models discovered");
+		const discoveredVariants = createModelVariants(discovered);
+		writeModelCache(CACHE_KEY, discovered);
+		const changed = !sameVariantIds(discoveredVariants, variants);
+		if (changed) {
+			// Swap the registered list live; registerProvider after the initial load
+			// phase takes effect immediately, so no /reload is needed.
+			pi.unregisterProvider(PROVIDER);
+			pi.registerProvider(PROVIDER, providerDefinition(discoveredVariants));
+			notify?.(`codex-app-server: model list refreshed — ${discoveredVariants.length} models`, "info");
+		}
+		variants = discoveredVariants;
+		modelCatalog.clear();
+		for (const variant of variants) modelCatalog.set(variant.id, variant);
+		return { changed, models: variants.length };
+	};
+
+	function refreshInBackground(force: boolean, notify?: Parameters<AcpRefresher>[0]["notify"]): void {
+		if (refreshInFlight) return;
+		refreshInFlight = (async () => {
+			try {
+				await refresh({ force, notify });
+			} catch (error) {
+				const message = `codex-app-server: model refresh failed: ${
+					error instanceof Error ? error.message : String(error)
+				}`;
+				console.error(`[codex-app-server] ${message}`);
+				notify?.(message, "error");
+			}
+		})().finally(() => {
+			refreshInFlight = null;
+		});
+	}
+
+	gate.setRefresher(refresh);
 
 	pi.on("session_start", async (_event, ctx) => {
 		boundPiSessionKey = ctx.sessionManager.getSessionFile() ?? ctx.sessionManager.getSessionId();
 		boundCwd = ctx.sessionManager.getCwd();
+		// A stale (or missing) cache refreshes in the background; startup never waits for it.
+		const entry = readModelCache<unknown>(CACHE_KEY);
+		if (!entry || isModelCacheStale(entry)) {
+			refreshInBackground(entry == null, (message, level) => ctx.ui.notify(message, level));
+		}
 	});
 
 	pi.on("session_shutdown", async () => {

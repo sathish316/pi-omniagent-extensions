@@ -31,7 +31,7 @@ files (only the spawned command and a few protocol details differ):
 │                                                                        │
 │   ┌────────────────────────  Extension  ───────────────────────────┐  │
 │   │                                                                 │  │
-│   │  registerProvider(...)   ← models discovered at startup         │  │
+│   │  registerProvider(...)   ← models from cache, or discovered      │  │
 │   │  Bridge (singleton)      ← owns one external session/thread     │  │
 │   │   • runExclusive() queue ← serializes prompts                   │  │
 │   │   • sentMessageCount     ← tracks what's already been sent      │  │
@@ -128,12 +128,18 @@ sequenceDiagram
     participant Proc as JSON-RPC client
     participant Agent as External agent CLI
 
-    Note over Pi,Agent: Startup — model discovery
+    Note over Pi,Agent: Startup — model discovery (cache miss only)
     Pi->>Ext: load extension
-    Ext->>Proc: spawn CLI, initialize
-    Proc->>Agent: initialize / new session
-    Agent-->>Proc: availableModels / configOptions
-    Ext->>Pi: registerProvider(models[])
+    Ext->>Ext: read acp-cache/<provider>.json
+    alt cache hit (fresh)
+        Ext->>Pi: registerProvider(cached models[])
+    else cache miss or stale
+        Ext->>Proc: spawn CLI, initialize
+        Proc->>Agent: initialize / new session
+        Agent-->>Proc: availableModels / configOptions
+        Ext->>Pi: registerProvider(models[])
+        Ext->>Ext: write cache; stale refresh continues in background
+    end
 
     Note over User,Agent: User picks a model
     User->>Pi: /model → select "Cursor <model>"

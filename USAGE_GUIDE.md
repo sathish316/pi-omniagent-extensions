@@ -21,8 +21,9 @@ For how these extensions work internally, see `HOW_IT_WORKS.md`.
    ```
 
 2. **Install and authenticate each external CLI** you intend to use. Each
-   extension spawns its CLI as a child process and discovers models at startup, so
-   the CLI must be on your `PATH` and logged in:
+   extension spawns its CLI as a child process to discover models (once; the
+   result is cached in `acp-cache/` and refreshed in the background after it
+   expires), so the CLI must be on your `PATH` and logged in:
 
    | Extension | Required CLI | Default command |
    |-----------|-------------|-----------------|

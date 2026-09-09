@@ -10,7 +10,8 @@ import {
 	type Model,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import { acpProviderGate } from "./acp-lib/config.ts";
+import { acpProviderGate, type AcpRefresher } from "./acp-lib/config.ts";
+import { isModelCacheStale, readModelCache, writeModelCache } from "./acp-lib/model-cache.ts";
 
 const PROVIDER = "rovo-acp";
 const API = "rovo-acp";
@@ -697,22 +698,23 @@ function streamRovoProvider(model: Model<any>, context: Context, options?: Simpl
 	return stream;
 }
 
-export default async function rovoAcpExtension(pi: ExtensionAPI) {
-	const gate = acpProviderGate(pi, "rovo");
-	if (!gate.enabled) return;
+const CACHE_KEY = "rovo-acp";
 
-	let models: RovoModelInfo[];
-	try {
-		models = await discoverRovoModels();
-	} catch (error) {
-		models = [{ modelId: FALLBACK_MODEL_ID, name: "Auto" }];
-		console.error(
-			`[rovo-acp] failed to discover Rovo ACP models: ${error instanceof Error ? error.message : String(error)}`,
-		);
+/** Revalidate a cached model list; null on any shape drift means "cache miss". */
+function reviveCachedModels(raw: unknown): RovoModelInfo[] | null {
+	if (!Array.isArray(raw) || raw.length === 0) return null;
+	const out: RovoModelInfo[] = [];
+	for (const item of raw) {
+		if (!item || typeof item !== "object") return null;
+		const entry = item as Record<string, unknown>;
+		if (typeof entry.modelId !== "string" || typeof entry.name !== "string") return null;
+		out.push({ modelId: entry.modelId, name: entry.name });
 	}
-	for (const m of models) modelCatalog.set(m.modelId, m);
+	return out;
+}
 
-	pi.registerProvider(PROVIDER, {
+function providerDefinition(models: RovoModelInfo[]) {
+	return {
 		name: "Rovo Dev (ACP)",
 		baseUrl: "stdio://rovo/acp",
 		apiKey: "rovo-acp",
@@ -722,17 +724,99 @@ export default async function rovoAcpExtension(pi: ExtensionAPI) {
 			id: m.modelId,
 			name: `Rovo ${m.name}`,
 			reasoning: isReasoningModel(m.modelId),
-			input: ["text"],
+			input: ["text"] as ("text" | "image")[],
 			contextWindow: contextWindowFor(m.modelId),
 			maxTokens: 16_384,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		})),
-	});
-	gate.loaded(models.length);
+	};
+}
+
+function sameModelIds(a: RovoModelInfo[], b: RovoModelInfo[]): boolean {
+	if (a.length !== b.length) return false;
+	return a.every((m, index) => m.modelId === b[index].modelId);
+}
+
+export default async function rovoAcpExtension(pi: ExtensionAPI) {
+	const gate = acpProviderGate(pi, "rovo");
+	if (!gate.enabled) return;
+
+	const cached = readModelCache<unknown>(CACHE_KEY);
+	const cachedModels = cached ? reviveCachedModels(cached.models) : null;
+	let models: RovoModelInfo[];
+	let source: string;
+	if (cachedModels) {
+		models = cachedModels;
+		source = "cache";
+	} else {
+		// First run (or wiped cache): pay the one-time discovery cost so the model
+		// picker is real from the start; every later start is a cache hit.
+		try {
+			models = await discoverRovoModels();
+			writeModelCache(CACHE_KEY, models);
+			source = "discovered";
+		} catch (error) {
+			models = [{ modelId: FALLBACK_MODEL_ID, name: "Auto" }];
+			source = "fallback";
+			console.error(
+				`[rovo-acp] failed to discover Rovo ACP models: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+	for (const m of models) modelCatalog.set(m.modelId, m);
+
+	pi.registerProvider(PROVIDER, providerDefinition(models));
+	gate.loaded(models.length, source);
+
+	let refreshInFlight: Promise<void> | null = null;
+
+	const refresh: AcpRefresher = async ({ force, notify }) => {
+		const entry = readModelCache<unknown>(CACHE_KEY);
+		if (!force && entry && !isModelCacheStale(entry)) return { changed: false, models: models.length };
+
+		const discovered = await discoverRovoModels();
+		writeModelCache(CACHE_KEY, discovered);
+		const changed = !sameModelIds(discovered, models);
+		if (changed) {
+			// Swap the registered list live; registerProvider after the initial load
+			// phase takes effect immediately, so no /reload is needed.
+			pi.unregisterProvider(PROVIDER);
+			pi.registerProvider(PROVIDER, providerDefinition(discovered));
+			notify?.(`rovo-acp: model list refreshed — ${discovered.length} models`, "info");
+		}
+		models = discovered;
+		modelCatalog.clear();
+		for (const m of discovered) modelCatalog.set(m.modelId, m);
+		return { changed, models: discovered.length };
+	};
+
+	function refreshInBackground(force: boolean, notify?: Parameters<AcpRefresher>[0]["notify"]): void {
+		if (refreshInFlight) return;
+		refreshInFlight = (async () => {
+			try {
+				await refresh({ force, notify });
+			} catch (error) {
+				const message = `rovo-acp: model refresh failed: ${
+					error instanceof Error ? error.message : String(error)
+				}`;
+				console.error(`[rovo-acp] ${message}`);
+				notify?.(message, "error");
+			}
+		})().finally(() => {
+			refreshInFlight = null;
+		});
+	}
+
+	gate.setRefresher(refresh);
 
 	pi.on("session_start", async (_event, ctx) => {
 		boundPiSessionKey = ctx.sessionManager.getSessionFile() ?? ctx.sessionManager.getSessionId();
 		boundCwd = ctx.sessionManager.getCwd();
+		// A stale (or missing) cache refreshes in the background; startup never waits for it.
+		const entry = readModelCache<unknown>(CACHE_KEY);
+		if (!entry || isModelCacheStale(entry)) {
+			refreshInBackground(entry == null, (message, level) => ctx.ui.notify(message, level));
+		}
 	});
 
 	pi.on("session_shutdown", async () => {
