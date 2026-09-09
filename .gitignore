@@ -3,3 +3,4 @@ node_modules/
 
 # Local ACP provider toggles. Copy acp-config.sample.json to get started.
 acp-config.json
+acp-cache/

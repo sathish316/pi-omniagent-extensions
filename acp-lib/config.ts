@@ -85,11 +85,22 @@ export type AcpDecision = {
 	reason: string;
 };
 
+/** Notify callback shared with refreshers (same shape as ctx.ui.notify for the levels we use). */
+export type AcpNotify = (message: string, level: "info" | "error") => void;
+
+/** Re-discover one provider's model list; registered by each loaded ACP extension. */
+export type AcpRefresher = (opts: {
+	force: boolean;
+	notify?: AcpNotify;
+}) => Promise<{ changed: boolean; models: number }>;
+
 type LoadRecord = AcpDecision & {
 	/** Milliseconds spent loading (0 for skipped providers). */
 	ms: number;
 	/** Number of models registered. */
 	models: number;
+	/** Where the startup model list came from: cache | discovered | fallback. */
+	source?: string;
 	error?: string;
 };
 
@@ -100,6 +111,8 @@ type SharedState = {
 	round: Set<AcpProvider>;
 	announced: boolean;
 	commandOwner: AcpProvider | null;
+	/** Model-list refreshers, registered by each loaded provider's factory. */
+	refreshers: Map<AcpProvider, AcpRefresher>;
 };
 
 /**
@@ -113,7 +126,14 @@ function sharedState(): SharedState {
 	const g = globalThis as Record<string, unknown>;
 	let state = g[STATE_KEY] as SharedState | undefined;
 	if (!state) {
-		state = { config: null, records: new Map(), round: new Set(), announced: false, commandOwner: null };
+		state = {
+			config: null,
+			records: new Map(),
+			round: new Set(),
+			announced: false,
+			commandOwner: null,
+			refreshers: new Map(),
+		};
 		g[STATE_KEY] = state;
 	}
 	return state;
@@ -291,9 +311,11 @@ export type AcpGate = {
 	enabled: boolean;
 	reason: string;
 	/** Record a successful load. Call right after registerProvider(). */
-	loaded(modelCount: number): void;
+	loaded(modelCount: number, source?: string): void;
 	/** Record a load that blew up, so the summary can say so. */
 	failed(error: unknown): void;
+	/** Register this provider's /acp-config refresh handler. */
+	setRefresher(refresher: AcpRefresher): void;
 };
 
 /**
@@ -311,6 +333,7 @@ export function acpProviderGate(pi: ExtensionAPI, provider: AcpProvider): AcpGat
 	if (state.round.has(provider)) {
 		state.round.clear();
 		state.records.clear();
+		state.refreshers.clear();
 		state.announced = false;
 		state.commandOwner = null;
 		state.config = null;
@@ -321,13 +344,14 @@ export function acpProviderGate(pi: ExtensionAPI, provider: AcpProvider): AcpGat
 	const startedAt = performance.now();
 	let recorded = false;
 
-	const record = (models: number, error?: string) => {
+	const record = (models: number, error?: string, source?: string) => {
 		if (recorded) return;
 		recorded = true;
 		state.records.set(provider, {
 			...decision,
 			ms: decision.enabled ? performance.now() - startedAt : 0,
 			models,
+			source,
 			error,
 		});
 	};
@@ -336,14 +360,23 @@ export function acpProviderGate(pi: ExtensionAPI, provider: AcpProvider): AcpGat
 
 	if (!decision.enabled) {
 		record(0);
-		return { enabled: false, reason: decision.reason, loaded: () => {}, failed: () => {} };
+		return {
+			enabled: false,
+			reason: decision.reason,
+			loaded: () => {},
+			failed: () => {},
+			setRefresher: () => {},
+		};
 	}
 
 	return {
 		enabled: true,
 		reason: decision.reason,
-		loaded: (modelCount: number) => record(modelCount),
+		loaded: (modelCount: number, source?: string) => record(modelCount, undefined, source),
 		failed: (error: unknown) => record(0, error instanceof Error ? error.message : String(error)),
+		setRefresher: (refresher: AcpRefresher) => {
+			state.refreshers.set(provider, refresher);
+		},
 	};
 }
 
@@ -361,8 +394,38 @@ function registerSummary(pi: ExtensionAPI, provider: AcpProvider, state: SharedS
 	if (state.commandOwner === null) {
 		state.commandOwner = provider;
 		pi.registerCommand("acp-config", {
-			description: "Show which ACP model providers are enabled and how long they took to load",
-			handler: async (_args, ctx) => {
+			description: "Show ACP provider status, or refresh cached model lists with: /acp-config refresh",
+			handler: async (args, ctx) => {
+				const action = args.trim().toLowerCase();
+				if (action === "refresh") {
+					const entries = ACP_PROVIDERS.flatMap((p) => {
+						const refresher = state.refreshers.get(p);
+						return refresher ? ([[p, refresher]] as const) : [];
+					});
+					if (entries.length === 0) {
+						ctx.ui.notify("No ACP providers are loaded; nothing to refresh.", "warning");
+						return;
+					}
+					const lines: string[] = [];
+					for (const [provider, refresher] of entries) {
+						const label = PROVIDER_LABELS[provider];
+						try {
+							const result = await refresher({
+								force: true,
+								notify: (message, level) => ctx.ui.notify(message, level),
+							});
+							lines.push(
+								`${label}: ${result.models} model${result.models === 1 ? "" : "s"}, ${
+									result.changed ? "list updated" : "no changes"
+								}`,
+							);
+						} catch (error) {
+							lines.push(`${label}: failed — ${error instanceof Error ? error.message : String(error)}`);
+						}
+					}
+					ctx.ui.notify(lines.join("\n"), "info");
+					return;
+				}
 				ctx.ui.notify(formatAcpConfigReport(state.records), "info");
 			},
 		});
@@ -377,6 +440,12 @@ function modelCount(n: number): string {
 	return `${n} model${n === 1 ? "" : "s"}`;
 }
 
+/** `12 models (cache), 0.01s` — the loaded-detail fragment shared by both reports. */
+function loadedDetail(record: LoadRecord): string {
+	const base = record.error ? `failed: ${record.error}` : modelCount(record.models);
+	return `${base}${record.source ? ` (${record.source})` : ""}, ${seconds(record.ms)}`;
+}
+
 /** The two lines Pi shows at startup. */
 export function formatAcpSummary(records: Map<AcpProvider, LoadRecord>): string {
 	const ordered = ACP_PROVIDERS.map((p) => records.get(p)).filter((r): r is LoadRecord => r !== undefined);
@@ -389,9 +458,7 @@ export function formatAcpSummary(records: Map<AcpProvider, LoadRecord>): string 
 		`ACP model providers loaded: ${
 			loaded.length === 0
 				? "none"
-				: loaded
-						.map((r) => `${r.label} (${r.error ? `failed: ${r.error}` : modelCount(r.models)}, ${seconds(r.ms)})`)
-						.join(", ")
+				: loaded.map((r) => `${r.label} (${loadedDetail(r)})`).join(", ")
 		}`,
 	);
 	if (skipped.length > 0) {
@@ -419,9 +486,7 @@ export function formatAcpConfigReport(records: Map<AcpProvider, LoadRecord>): st
 			lines.push(`  ${label}: not installed`);
 			continue;
 		}
-		const detail = record.enabled
-			? `${record.error ? `failed: ${record.error}` : modelCount(record.models)}, ${seconds(record.ms)}`
-			: "skipped";
+		const detail = record.enabled ? loadedDetail(record) : "skipped";
 		lines.push(`  ${label}: ${record.enabled ? "enabled" : "disabled"} — ${detail} [${record.reason}]`);
 	}
 	const totalMs = [...records.values()].reduce((sum, r) => sum + r.ms, 0);

@@ -89,10 +89,13 @@ The Pi API packages imported by the extensions are provided by the running Pi in
 
 ## Choosing which ACP providers load
 
-Each extension discovers its models by spawning the underlying agent CLI at
-startup, and that is where Pi's startup time goes. On this machine, loading all
-four costs about **13.9s**; loading none costs about **1.0s**. `acp-config.json`
-decides which ones pay that cost.
+Each extension discovers its models by spawning the underlying agent CLI, which
+used to be where Pi's startup time went — on this machine, loading all four
+cost about **13.9s**. Discovery results are now cached on disk, so the spawn
+happens once (first run, or after the cache expires); every later start
+registers models from the cache in milliseconds. `acp-config.json` still
+decides which providers load at all. See
+[Caching model discovery](#caching-model-discovery).
 
 ### The config file
 
@@ -180,12 +183,44 @@ ENABLE_CODEX_ACP=1 pi     # Codex models only
 ENABLE_CURSOR_ACP=1 ENABLE_CLAUDE_ACP=1 pi   # Cursor + Claude
 ```
 
+### Caching model discovery
+
+Model lists rarely change, so each provider caches its discovery result in
+`~/.pi/agent/extensions/acp-cache/<provider>.json` and registers from the cache
+at startup:
+
+- **Cache hit** — models register immediately; no CLI is spawned. A stale cache
+  (older than 24h by default) is refreshed in the background after
+  `session_start`, so startup never waits for it. When the refreshed list
+  differs, the provider is re-registered live — no `/reload` needed.
+- **Cache miss** (first run, wiped cache, or a discovery failure) — the
+  extension pays the one-time discovery cost during startup so the `/model`
+  picker is real from the start, then writes the cache. Failures are not
+  cached, so a temporarily missing CLI is retried on the next start.
+
+Force a refresh for every loaded provider with:
+
+```
+/acp-config refresh
+```
+
+Useful when you just installed a new Cursor/Claude/Codex version and want its
+new models without waiting for the TTL.
+
+| Env var | Effect |
+| --- | --- |
+| `ACP_MODEL_CACHE_TTL_MS` | How long a cached model list stays fresh (default 24h). |
+| `PI_ACP_CACHE_DIR` | Read/write caches from another directory. |
+
+The startup summary and `/acp-config` report where each provider's model list
+came from — `(cache)`, `(discovered)`, or `(fallback)` — next to the load time.
+
 ### What Pi shows at startup
 
 ```
-ACP model providers loaded: cursor-acp (32 models, 9.07s), codex-app-server (29 models, 1.59s)
+ACP model providers loaded: cursor-acp (32 models (cache), 0.00s), codex-app-server (29 models (cache), 0.01s)
 ACP model providers skipped: claude-code-acp (enable_claude_acp_models not set), rovo-acp (enable_rovo_acp_models not set)
-Time taken for loading ACP models: 10.66s
+Time taken for loading ACP models: 0.01s
 ```
 
 Skipped providers list the rule that turned them off, so it is always clear
@@ -193,4 +228,6 @@ whether a model is missing because of the config file, an env toggle, or a CLI
 that failed to start.
 
 Run `/acp-config` inside Pi for the full picture — resolved config path, every
-key's value, per-provider load time, and the current env toggles.
+key's value, per-provider load time and model-list source, and the current env
+toggles. `/acp-config refresh` re-discovers every loaded provider's models and
+re-registers them if the list changed.
